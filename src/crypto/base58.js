@@ -7,7 +7,11 @@
  * addresses exactly 95 characters (69 bytes → 8×11 + 7).
  */
 
-const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZ'; // no 0, O, I, l (Bitcoin/Monero alphabet)
+// Monero/Bitcoin base58 alphabet: 58 chars, excludes 0 O I l.
+// NOTE: must be exactly 58 characters — a previous bug shipped a 33-char
+// alphabet here, which silently truncated encodings (index >= len => undefined).
+const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+if (ALPHABET.length !== 58) throw new Error('base58 alphabet must be 58 chars, got ' + ALPHABET.length);
 const BASE = 58n;
 const FULL_BLOCK_BYTES = 8;
 const FULL_BLOCK_CHARS = 11;
@@ -69,8 +73,18 @@ export function encode(bytes) {
   return out;
 }
 
-/** Decode Monero-style padded base58 string → bytes. Inverse of encode(). */
+/**
+ * Decode Monero-style padded base58 string → bytes. Inverse of encode().
+ * Like Monero's decoder, the input is greedily split into 11-char full blocks
+ * plus a tail whose length must be one of the valid encoded-block sizes.
+ */
 export function decode(str) {
+  // Build the reverse map from the authoritative forward table: for each byte
+  // count n, ENCODED_BLOCK_SIZES[n] chars decodes back to exactly n bytes.
+  const tailCharsToBytes = {};
+  for (let n = 1; n <= FULL_BLOCK_BYTES; n++) {
+    tailCharsToBytes[ENCODED_BLOCK_SIZES[n]] = n;
+  }
   const chunks = [];
   let pos = 0;
   while (str.length - pos >= FULL_BLOCK_CHARS) {
@@ -79,14 +93,10 @@ export function decode(str) {
   }
   const remaining = str.length - pos;
   if (remaining > 0) {
-    const byteLen = DECODED_BLOCK_SIZES[remaining];
+    const byteLen = tailCharsToBytes[remaining];
     if (!byteLen) throw new Error(`Invalid base58 tail length ${remaining}`);
     chunks.push(bigToBytes(decodeBlock(str.slice(pos)), byteLen));
   }
-  return Uint8Array.concat ? concatAll(chunks) : merge(chunks);
-}
-
-function concatAll(chunks) {
   return merge(chunks);
 }
 
