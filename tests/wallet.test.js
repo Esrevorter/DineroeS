@@ -73,44 +73,97 @@ test('full transfer: miner pays alice, alice pays bob, double spend rejected', a
   const chain = new Blockchain();
   chain.initGenesis();
   const miner = new Wallet(randomSeed());
-  let prev = chain.tip();
-  for (let i = 0; i < COINBASE_MATURITY + 1; i++) {
-    prev = mineNext(chain, miner, prev, 120, [], 0n, BigInt(i + 1));
-  }
-  miner.scanChain(chain);
-
   const alice = new Wallet(randomSeed());
   const bob = new Wallet(randomSeed());
+  const sleep = () => new Promise((r) => setTimeout(r, 5)); // distinct timestamps
 
-  // v0.1 has visible amounts and binds each DECLARED input amount to the ONE
-  // ring member sharing that amount — so a wallet spend needs its source
-  // output's amount to be unique among live outputs, AND its ring must not
-  // contain any other member with that same amount (else binding is
-  // ambiguous). All early coinbases pay the SAME base reward (piecewise-
-  // constant emission curve), so we bootstrap uniqueness with one legitimate
-  // trick: a block carrying a real tx collects its fee into the coinbase
-  // (reward = base + fee) — an amount seen nowhere else. The bootstrap tx
-  // itself is a valid miner→miner self-payment whose input total is NOT
-  // declared: per #tryApplyTxs, an undeclared total skips binding/balance
-  // enforcement (v0.1 escape hatch until RingCT lands). Its key image still
-  // permanently marks the seed output spent.
+  // ─────────────────────────────────────────────────────────────────────────
+  // v0.1 constraint this setup works around: amounts are VISIBLE and the
+  // chain binds each DECLARED input total (tx.inputAmountTotal) to the ONE
+  // ring member sharing that amount (#tryApplyTxs in blockchain.js). So a
+  // declared-input spend needs its source amount A to appear EXACTLY ONCE
+  // among live outputs — which means the ring needs a same-amount DECOY too,
+  // i.e. A must appear ≥2× live while only ONE instance may end up in any
+  // ring. All early coinbases pay the identical base reward, so we bootstrap
+  // the required state with two legitimate mechanisms:
+  //
+  //  • UNDECLARED escape hatch: a tx with no inputAmountTotal skips binding/
+  //    balance checks entirely (until RingCT lands). One bootstrap self-pay
+  //    uses it — its key image still permanently marks the seed output spent.
+  //  • Fee-collecting coinbases: a block carrying a real fee-F tx pays
+  //    base+F — an amount seen nowhere else. Chaining such txs yields a
+  //    ladder of DISTINCT unique coinbase amounts U1 < U2 < ... < Uk, each
+  //    rung's own self-output paying a burn-shifted value Si ≠ anything else.
+  //    Crucially, spending Ui leaves Ui OUT of the live set, so when tx1
+  //    spends Uk (the fresh top rung) the pool of same-amount decoys for
+  //    earlier rungs stays intact while Uk itself has NO twin — exactly what
+  //    the "bind to the ONE member" rule requires… except the ring must then
+  //    contain ZERO other members of amount Uk, which holds trivially since
+  //    Uk was just minted. ✓
+  //
+  // Rings are assembled deterministically from amount-keyed pools:
+  //   ringFor(realKey, A) = [live outputs of amount A ≠ real]  (may be empty)
+  //                       + [live outputs of amounts ≠ A, to fill RING_SIZE-1]
+  // For declared spends of amount A the chain demands EXACTLY ONE member of
+  // amount A in the ring (the real one), so sameAmt must be EMPTY and mixins
+  // must all differ from A. For undeclared bootstrap txs any mix is legal.
+  // ─────────────────────────────────────────────────────────────────────────
   const fee = 1_000_000n; // pDNE per transfer
 
-  /** Pick `count` live-output decoys excluding `excludeHex`, all with an
-   *  amount different from `avoidAmount` (prevents binding ambiguity). */
-  function pickSafeDecoys(excludeHex, avoidAmount, count) {
+  function pickBy(predFn, count, excludeHex) {
     const keys = [...chain.outputsByKey.keys()].filter(
-      (k) => k !== excludeHex && BigInt(chain.outputsByKey.get(k).amount) !== avoidAmount,
+      (k) => k !== excludeHex && predFn(BigInt(chain.outputsByKey.get(k).amount)),
     );
-    if (keys.length < count) throw new Error(`not enough non-colliding decoys (${keys.length}/${count})`);
+    if (keys.length < count) throw new Error(`not enough decoys (${keys.length}/${count})`);
     const picked = new Set();
     while (picked.size < count) picked.add(keys[Math.floor(Math.random() * keys.length)]);
     return [...picked];
   }
 
+  /** Ring for a DECLARED spend of amount A: the real key is the ONLY member
+   *  with amount A (chain binding requires candidates.length === 1), plus
+   *  RING_SIZE-1 different-amount mixins. Spliced in at `realIdx`. */
+  function ringForDeclared(realKeyHex, realKeyBytes, A, realIdx) {
+    const others = pickBy((a) => a !== A, RING_SIZE - 1, realKeyHex);
+    const ring = others.map(hexToBytes);
+    ring.splice(realIdx, 0, realKeyBytes);
+    return ring;
+  }
+
+  // Generic single-input, single-output DECLARED spend: srcOut (from wallet w)
+  // → recipient `account`, paying `outAmount`, declaring total A = srcOut.amount,
+  // burning the remainder (A - outAmount - fee ≥ 0). Fully consensus-checked.
+  function mkSpend(w, account, srcOut, outAmount, randR) {
+    const A = srcOut.amount;
+    const x = deriveOutputSecret(srcOut.txPublicKey, w.viewSecret, w.spendSecret);
+    const ring = ringForDeclared(srcOut.keyHex, srcOut.key, A, 3);
+    const prepared = prepareOutputs([{ amountPico: outAmount, address: account }], () => randR);
+    const unsigned = buildTxPrefix({
+      inputs: [{ ring }],
+      outputs: prepared.map((p) => ({ amountPico: p.amountPico, key: p.key })),
+      feePico: fee,
+      extra: assembleExtra(prepared),
+    });
+    const tx = signTx(unsigned, [{ realIndex: 3, x }]);
+    tx.inputAmountTotal = A;
+    return tx;
+  }
+
+  // ── Phase 1: bootstrap maturity window (61 empty blocks, feesPico=0) ──
+  let prev = chain.tip();
+  for (let i = 0; i < COINBASE_MATURITY + 1; i++) {
+    prev = mineNext(chain, miner, prev, 120, [], 0n, BigInt(i + 1));
+    await sleep();
+  }
+  miner.scanChain(chain);
+
+  // ── Phase 2: bootstrap self-pay (undeclared input-total escape hatch) ──
+  // Spends one matured base-reward coinbase, burns 1 pico, pays base-1 back
+  // to the miner. Its BLOCK's coinbase pays base+1 (= U1, unique).
   const mkSelfPay = (sourceOut, rScalar) => {
     const x = deriveOutputSecret(sourceOut.txPublicKey, miner.viewSecret, miner.spendSecret);
-    const decoys = pickSafeDecoys(sourceOut.keyHex, sourceOut.amount, RING_SIZE - 1);
+    // Undeclared total ⇒ binding skipped ⇒ same-amount members are legal here.
+    const decoys = pickBy(() => true, RING_SIZE - 1, sourceOut.keyHex);
     const ring = decoys.map(hexToBytes);
     const realIdx = 2;
     ring.splice(realIdx, 0, sourceOut.key);
@@ -126,91 +179,99 @@ test('full transfer: miner pays alice, alice pays bob, double spend rejected', a
     });
     return signTx(unsigned, [{ realIndex: realIdx, x }]); // deliberately no inputAmountTotal
   };
-
-  // Block X: self-pay burning 1 pico. Its coinbase pays base+1 (unique) and
-  // its self-output pays base-1 (also unique). The only other differently-
-  // valued live outputs are the genesis coinbase (no outputs — height 0 pays
-  // nothing) and… none: every other coinbase pays exactly `base`. So the
-  // safe-decoy pool for spending X's coinbase is the set of base-reward
-  // coinbases (amount ≠ base+1) plus X's own base-1 self-output. Plenty.
   const seedOut = miner.availableOutputs(chain.height)[0];
   assert.ok(seedOut, 'need a matured coinbase to bootstrap');
   prev = mineNext(chain, miner, prev, 120, [mkSelfPay(seedOut, 5n)], 0n, 99n);
-  await new Promise((r) => setTimeout(r, 5));
-  const heightX = prev.header.height;
-  const uniqueAmount = prev.coinbase.outputs[0].amount; // base + 1, seen once
+  await sleep();
 
-  // Mine forward until X's coinbase matures, then spend it → alice.
-  const payAlice = uniqueAmount - fee;
-  while (chain.height < heightX + COINBASE_MATURITY) {
-    prev = mineNext(chain, miner, prev, 120, [], 0n, BigInt(heightX + 1000 + chain.blocks.length));
-    await new Promise((r) => setTimeout(r, 5));
+  // ── Phase 3: unique-amount ladder via REAL declared fee-bearing self-pays ──
+  // Rung i spends Ui (declared ⇒ fully checked; valid because Ui appears
+  // exactly once live and its ring contains no other Ui-valued member),
+  // collects fee F into the next coinbase (U(i+1) = base + F·i + 1) and pays
+  // the miner Si = Ui - F - burn_i (burn_i = 1000·i keeps every Si distinct
+  // from every Uj and Sk). After 4 rungs, U5 = base + 4F + 1 is freshly
+  // minted, unique, and immediately spendable (non-coinbase unlockTime = 0).
+  const minerAccount = keysFromAddress(miner.getAddress());
+  let curU = prev.coinbase.outputs[0].amount; // U1 = base + 1
+  const seen = new Map(); // amount string -> description (distinctness audit)
+  seen.set(curU.toString(), 'U1');
+  for (let i = 1; i <= 4; i++) {
+    miner.scanChain(chain);
+    const srcOut = miner.availableOutputs(chain.height).find((o) => o.amount === curU);
+    assert.ok(srcOut, `ladder rung ${i}: need live output with amount ${curU}`);
+    const burn = 1000n * BigInt(i);
+    const s = curU - fee - burn;
+    assert.ok(!seen.has(s.toString()), `rung ${i} self-output amount collides with ${seen.get(s.toString())}`);
+    seen.set(s.toString(), `S${i}`);
+    const tx = mkSpend(miner, minerAccount, srcOut, s, 100n + BigInt(i));
+    assert.ok(verifyTxStructure(tx).ok, `ladder tx ${i} invalid: ${verifyTxStructure(tx).reason}`);
+    prev = mineNext(chain, miner, prev, 120, [tx], fee, BigInt(200 + i));
+    await sleep();
+    curU = prev.coinbase.outputs[0].amount; // U(i+1) = base + F·i + 1
+    assert.ok(!seen.has(curU.toString()), `rung ${i + 1} coinbase amount collides`);
+    seen.set(curU.toString(), `U${i + 1}`);
   }
   miner.scanChain(chain);
-  // Build tx1 manually so its ring avoids any member with amount ==
-  // uniqueAmount (only X's coinbase itself has it — excluded as decoy).
-  const src1 = miner.availableOutputs(chain.height).find((o) => o.amount === uniqueAmount);
-  assert.ok(src1, 'unique coinbase must be matured & available');
-  const x1 = deriveOutputSecret(src1.txPublicKey, miner.viewSecret, miner.spendSecret);
+  const uTop = curU; // U5, unique & live (just minted by rung 4's block)
+
+  // ── tx1: spend the ladder-top unique coinbase U5 → alice ──
+  // Declared total A = U5: exactly one live output carries it (the real
+  // source), so ringForDeclared builds a ring whose ONLY U5 member is real —
+  // the chain binds unambiguously. Pays alice U5 - fee - burn1 (burn keeps
+  // alice's amount distinct from every ladder value → tx2 can bind later).
+  const src1 = miner.availableOutputs(chain.height).find((o) => o.amount === uTop);
+  assert.ok(src1, 'ladder-top coinbase must be available');
   const aliceAccount = keysFromAddress(alice.getAddress());
-  const prep1 = prepareOutputs([{ amountPico: payAlice, address: aliceAccount }], () => 7n);
-  const ring1 = pickSafeDecoys(src1.keyHex, uniqueAmount, RING_SIZE - 1).map(hexToBytes);
-  const realIdx1 = 4;
-  ring1.splice(realIdx1, 0, src1.key);
-  const tx1 = signTx(
-    buildTxPrefix({
-      inputs: [{ ring: ring1 }],
-      outputs: prep1.map((p) => ({ amountPico: p.amountPico, key: p.key })),
-      feePico: fee,
-      extra: assembleExtra(prep1),
-    }),
-    [{ realIndex: realIdx1, x: x1 }],
-  );
-  tx1.inputAmountTotal = uniqueAmount;
+  const burn1 = 5000n;
+  const payAlice = uTop - fee - burn1;
+  assert.ok(!seen.has(payAlice.toString()), 'alice payment amount must stay globally unique');
+  seen.set(payAlice.toString(), 'payAlice');
+  const tx1 = mkSpend(miner, aliceAccount, src1, payAlice, 7n);
   assert.ok(verifyTxStructure(tx1).ok, `tx1 invalid: ${verifyTxStructure(tx1).reason}`);
   assert.equal(tx1.inputs[0].ring.length, RING_SIZE);
-  assert.equal(tx1.inputAmountTotal, uniqueAmount);
-  mineNext(chain, miner, prev, 120, [tx1], fee, 101n);
-  prev = chain.tip();
-  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(tx1.inputAmountTotal, uTop);
+  prev = mineNext(chain, miner, prev, 120, [tx1], fee, 101n);
+  await sleep();
 
   alice.scanChain(chain);
   assert.equal(alice.balancePico(), payAlice, 'alice received exactly the payment');
 
-  // ── alice → bob: spend her single (globally unique-amount) input, no change ──
-  const src2 = alice.availableOutputs(chain.height)[0];
-  assert.equal(src2.amount, payAlice);
-  const x2 = deriveOutputSecret(src2.txPublicKey, alice.viewSecret, alice.spendSecret);
+  // ── tx2: alice → bob (via the high-level wallet API) ──
+  // Alice holds ONE output of globally-unique amount payAlice. Her wallet's
+  // createTransaction declares inputAmountTotal = payAlice; the chain binds
+  // it to her output because no other LIVE output shares that amount (all
+  // ladder values were spent or differ; base-reward coinbases differ).
+  // Bob receives payAlice - fee - burn2 (no change output → exact balance).
   const bobAccount = keysFromAddress(bob.getAddress());
-  const prep2 = prepareOutputs([{ amountPico: payAlice - fee, address: bobAccount }], () => 9n);
-  const ring2 = pickSafeDecoys(src2.keyHex, payAlice, RING_SIZE - 1).map(hexToBytes);
-  const realIdx2 = 1;
-  ring2.splice(realIdx2, 0, src2.key);
-  const tx2 = signTx(
-    buildTxPrefix({
-      inputs: [{ ring: ring2 }],
-      outputs: prep2.map((p) => ({ amountPico: p.amountPico, key: p.key })),
-      feePico: fee,
-      extra: assembleExtra(prep2),
-    }),
-    [{ realIndex: realIdx2, x: x2 }],
-  );
-  tx2.inputAmountTotal = payAlice;
+  const burn2 = 3000n;
+  const payBob = payAlice - fee - burn2;
+  // Temporarily declare the burn via an explicit second output to ourselves?
+  // No — keep it simple: two recipients (bob + miner-burn is impossible), so
+  // instead split: bob gets payBob, and alice pays the rest as change to
+  // herself… but then her balance ≠ 0 after spending. Cleanest: single output
+  // to bob of payAlice - fee, zero burn, exact spend. Binding still fine:
+  // payAlice unique live. Do that.
+  const payBobFinal = payAlice - fee;
+  const tx2 = alice.createTransaction(chain, [{ address: bobAccount, amountPico: payBobFinal }], { feePico: fee });
   assert.ok(verifyTxStructure(tx2).ok, `tx2 invalid: ${verifyTxStructure(tx2).reason}`);
-  mineNext(chain, miner, prev, 120, [tx2], fee, 102n);
-  prev = chain.tip();
-  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(tx2.inputAmountTotal, payAlice);
+  prev = mineNext(chain, miner, prev, 120, [tx2], fee, 102n);
+  await sleep();
 
   bob.scanChain(chain);
-  assert.equal(bob.balancePico(), payAlice - fee, 'bob received payment minus fee');
+  assert.equal(bob.balancePico(), payBobFinal, 'bob received payment minus fee');
   assert.equal(alice.balancePico(), 0n, 'alice spent everything');
 
-  // ── double spend: rebuild an identical-looking tx from alice's now-spent output ──
-  // Re-derive her original output & secret directly (simulating a malicious replay).
+  // ── double spend: rebuild an equivalent tx from alice's now-spent output ──
+  // Re-derive her original output & secret directly (simulating a malicious
+  // replay). Its declared total payAlice now matches NO live output (hers was
+  // consumed), but the key-image check fires FIRST in #tryApplyTxs.
   const spentOut = [...alice.outputs.values()][0];
+  assert.equal(spentOut.amount, payAlice);
   const xd = deriveOutputSecret(spentOut.txPublicKey, alice.viewSecret, alice.spendSecret);
   const evilPrepared = prepareOutputs([{ amountPico: 1n, address: bobAccount }], () => 42n);
-  const evilRing = pickSafeDecoys(bytesToHex(spentOut.key), spentOut.amount, RING_SIZE - 1).map(hexToBytes);
+  const evilOthers = pickBy((a) => a !== payAlice, RING_SIZE - 1, spentOut.keyHex);
+  const evilRing = evilOthers.map(hexToBytes);
   evilRing.splice(3, 0, spentOut.key);
   const evil = signTx(
     buildTxPrefix({
@@ -221,7 +282,7 @@ test('full transfer: miner pays alice, alice pays bob, double spend rejected', a
     }),
     [{ realIndex: 3, x: xd }],
   );
-  evil.inputAmountTotal = spentOut.amount;
+  evil.inputAmountTotal = payAlice;
   const rejected = chain.addBlock(assembleBlock({
     timestamp: prev.header.timestamp + 120,
     prevId: hexToBytes(prev.id),
