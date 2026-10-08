@@ -16,7 +16,7 @@
  * index rebuilt at startup — simple, crash-safe (last line wins), auditable.
  */
 import { bytesToHex } from '../crypto/hash.js';
-import { genesisBlock, verifyBlockStructure, computeBlockId, serializeHeader } from './block.js';
+import { genesisBlock, verifyBlockStructure, computeBlockId, serializeHeader, deserializeHeader } from './block.js';
 import { verifyTxStructure, serializeTx } from './transaction.js';
 import { nextDifficultyLWMA } from './difficulty.js';
 import { RING_SIZE, TARGET_BLOCK_TIME } from '../constants.js';
