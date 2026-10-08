@@ -294,9 +294,21 @@ export class Blockchain {
     return this.addBlock(forkTipBlock);
   }
 
-  /** Pick random decoys for a ring (excluding the real key). Like Monero's pick_inputs. */
-  pickRing(excludeKeyHex, count = RING_SIZE) {
-    const keys = [...this.outputsByKey.keys()].filter((k) => k !== excludeKeyHex);
+  /**
+   * Pick random decoys for a ring (excluding the real key). Like Monero's
+   * pick_inputs — with one v0.1 twist: because amounts are VISIBLE and the
+   * chain binds a declared input total to the unique output carrying that
+   * amount (#tryApplyTxs), a decoy whose amount equals the real input's would
+   * make every spend of that amount permanently unbindable ("amount
+   * ambiguity"). A privacy-preserving wallet must therefore never mix in a
+   * same-amount output as the key it is spending. Passing `realAmountPico`
+   * enforces that at the API level; omitting it keeps the old behavior.
+   */
+  pickRing(excludeKeyHex, count = RING_SIZE, realAmountPico = undefined) {
+    const amt = realAmountPico === undefined ? null : BigInt(realAmountPico);
+    const keys = [...this.outputsByKey.entries()]
+      .filter(([k, info]) => k !== excludeKeyHex && (amt === null || BigInt(info.amount) !== amt))
+      .map(([k]) => k);
     if (keys.length < count - 1) throw new Error('not enough outputs for ring size');
     const picked = new Set();
     while (picked.size < count - 1) picked.add(keys[Math.floor(Math.random() * keys.length)]);

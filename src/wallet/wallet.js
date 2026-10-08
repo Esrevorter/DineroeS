@@ -148,8 +148,16 @@ export class Wallet {
       amountPico: BigInt(r.amountPico ?? parseDNE(r.amount)),
       address: typeof r.address === 'string' ? keysFromAddress(r.address) : r.address,
     }));
-    const change = inSum - needed;
+    let change = inSum - needed;
     if (change > 0n) {
+      // v0.1 visible-amount binding: the chain locates a declared spend by
+      // finding the ONE live output whose amount equals inputAmountTotal. If a
+      // change output reuses an already-pending recipient amount, that search
+      // becomes ambiguous and the tx can never bind — so bump the change by
+      // one pico until it is distinct from every other output of this tx.
+      // (The fee absorbs any leftover, keeping balance exact.)
+      const others = new Set(outSpecs.map((o) => o.amountPico));
+      while (others.has(change)) change += 1n;
       outSpecs.push({ amountPico: change, address: { spendPublic: this.spendPublic, viewPublic: this.viewPublic } });
     }
     const preparedOuts = prepareOutputs(outSpecs, randFn);
@@ -159,7 +167,10 @@ export class Wallet {
     const unsignedInputs = [];
     const perInputSecrets = [];
     for (const o of selected) {
-      const decoys = chain.pickRing(o.keyHex, RING_SIZE); // excludes the real key
+      // Exclude same-amount live outputs from the decoy pool: with visible
+      // amounts, a same-amount mixin would make this output's amount
+      // permanently unbindable on-chain (see chain.pickRing).
+      const decoys = chain.pickRing(o.keyHex, RING_SIZE, o.amount);
       const ring = decoys.map(hexToBytes);
       const realIdx = Math.floor(Math.random() * (ring.length + 1));
       ring.splice(realIdx, 0, o.key); // insert the real member at a random position
