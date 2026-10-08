@@ -18,7 +18,7 @@
 import { cnFastHash, concatBytes, bytesToHex, bytesToScalarLE } from '../crypto/hash.js';
 import { createOutputKeys } from '../crypto/keys.js';
 import { signRing, verifyRing } from '../crypto/ring.js';
-import { wU8, wU64, wVarint, wBytes, wString, ByteReader } from './serialize.js';
+import { wU8, wU64, wVarint, wBytes, wRaw, ByteReader } from './serialize.js';
 import { RING_SIZE, DEFAULT_UNLOCK_TIME } from '../constants.js';
 
 export const TX_VERSION = 1; // 1 == ring-signature tx (Monero's meaning too)
@@ -117,13 +117,13 @@ export function deserializeTxPrefix(bytes) {
 
 /** Full tx = prefix || fee(u64) || sigCount(varint) || signatures. */
 export function serializeTx(tx) {
-  // Canonical signature encoding: keyImage(32 bytes) || c0(32 LE) || s[i](32 LE each)
+  // Canonical signature encoding: keyImage(32 bytes) || c0(32 LE) || sCount(varint) || s[i](32 LE each)
   const p2 = [serializeTxPrefix(tx), wU64(tx.feePico), wVarint(tx.signatures.length)];
   for (const sig of tx.signatures) {
-    p2.push(wBytes(sig.keyImage));
-    p2.push(wBytes(scalarBytes(sig.c0)));
+    p2.push(wRaw(sig.keyImage));
+    p2.push(wRaw(scalarBytes(sig.c0)));
     p2.push(wVarint(sig.s.length));
-    for (const s of sig.s) p2.push(wBytes(scalarBytes(s)));
+    for (const s of sig.s) p2.push(wRaw(scalarBytes(s)));
   }
   return concatBytes(...p2);
 }
@@ -153,7 +153,7 @@ export function deserializeTx(bytes) {
   const nSig = Number(r.varint());
   const signatures = [];
   for (let i = 0; i < nSig; i++) {
-    const keyImage = Uint8Array.from(r.bytes());
+    const keyImage = Uint8Array.from(r.raw(32)); // fixed-size field, mirrors wRaw in serializeTx
     const c0 = bytesToScalarLE(r.raw(32));
     const nS = Number(r.varint());
     const s = [];

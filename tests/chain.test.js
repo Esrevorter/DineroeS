@@ -12,7 +12,7 @@ import { genesisBlock, assembleBlock, mineBlock, verifyBlockStructure, computeBl
 import { Blockchain } from '../src/chain/blockchain.js';
 import { bytesToHex, hexToBytes } from '../src/crypto/hash.js';
 import { keysFromSeed, randomSeed } from '../src/crypto/keys.js';
-import { TAIL_EMISSION_PER_BLOCK } from '../src/constants.js';
+import { TAIL_EMISSION_PER_BLOCK, RING_SIZE } from '../src/constants.js';
 
 // ── serialization ───────────────────────────────────────────────────────────
 test('varint roundtrip + known LEB128 vectors', () => {
@@ -246,12 +246,12 @@ test('full tx lifecycle on-chain: coinbase spend with ring signature', async () 
   const bob = kfs(rs());
   const ringDecoys = [];
   // not enough outputs for real rings yet — add synthetic decoy keys from fresh stealth derivations
-  while (ringDecoys.length < 10) {
+  while (ringDecoys.length < RING_SIZE - 1) {
     const d = prepareOutputs([{ amountPico: 1n, address: { spendPublic: kfs(rs()).spendPublic, viewPublic: kfs(rs()).viewPublic } }], () => modN(bytesToScalarLE(rs())));
     ringDecoys.push(d[0].key);
     chain.outputsByKey.set(bytesToHex(d[0].key), { height: 1, txIndex: 0, outIndex: 0, amount: 1n, unlockedUntil: 0 });
   }
-  const ring = [...ringDecoys.slice(0, 10)];
+  const ring = [...ringDecoys.slice(0, RING_SIZE - 1)];
   const realIdx = 4;
   ring.splice(realIdx, 0, cbOut.key);
 
