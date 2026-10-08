@@ -36,9 +36,27 @@ export const TARGET_BLOCK_TIME = 120;
 export const DIFFICULTY_LWMA_WINDOW = 60;
 /** Block size limits: median-based dynamic limit (Monero-style). */
 export const BLOCK_SIZE_MAX = 1_000_000; // absolute cap, bytes
-export const EMISSION_SPEED_FACTOR = 20; // Monero: 20 — controls initial supply curve
-/** Reward after base emission ends (Monero tail: 0.6 XMR/day → we use 0.3 DNE/block equivalent). */
-export const TAIL_EMISSION_PER_BLOCK = 300_000_000_000n; // 0.3 DNE per block
+
+// ── Emission curve (Monero's formula, retuned for DineroeS) ────────────────
+/**
+ * Monero:      base_reward(h) = M >> (h / C), decay per "halving" of C blocks.
+ *              Monero uses C = 1200 blocks (~4h halving-ish decay).
+ * DineroeS keeps the exact same shape but a much slower decay so the base
+ * reward is meaningful at 120 s blocks and does not collapse to zero instantly:
+ *   C = EMISSION_SPEED_FACTOR = 20_000 blocks ≈ 27.8 days per halving.
+ * With M = 100 DNE:
+ *   - first halving at height 20_000 (100 → 50 DNE)
+ *   - after 8 halvings (height 160_000) base = 0.39 DNE < tail ⇒ tail takes
+ *     over permanently from block 160_001
+ *   - pre-tail supply ≈ 3.98M DNE; then +0.6 DNE/block forever
+ *     (~2.1M DNE/year tail inflation — deliberately generous tail, like
+ *     Monero's permanent 0.6 XMR/block, scaled to our faster blocks)
+ */
+export const EMISSION_SPEED_FACTOR = 20_000;
+/** Initial base-reward amplitude M, in pDNE (100 DNE at block 1). */
+export const EMISSION_M_PICO = 100_000000000000n; // 100 * 10^12
+/** Permanent tail emission (Monero analog: 0.6 XMR/block; ours: 0.6 DNE/block). */
+export const TAIL_EMISSION_PER_BLOCK = 600_000000000n; // 0.6 DNE per block
 /** Block maturity: coinbase output must mature before spending (Monero: 60). */
 export const COINBASE_MATURITY = 60;
 
