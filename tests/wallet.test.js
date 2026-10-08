@@ -80,33 +80,41 @@ test('full transfer: miner pays alice, alice pays bob, double spend rejected', a
   // ─────────────────────────────────────────────────────────────────────────
   // v0.1 constraint this setup works around: amounts are VISIBLE and the
   // chain binds each DECLARED input total (tx.inputAmountTotal) to the ONE
-  // ring member sharing that amount (#tryApplyTxs in blockchain.js). So a
-  // declared-input spend needs its source amount A to appear EXACTLY ONCE
-  // among live outputs — which means the ring needs a same-amount DECOY too,
-  // i.e. A must appear ≥2× live while only ONE instance may end up in any
-  // ring. All early coinbases pay the identical base reward, so we bootstrap
-  // the required state with two legitimate mechanisms:
+  // ring member sharing that amount (#tryApplyTxs in blockchain.js). So every
+  // declared spend of amount A needs:
+  //   (i)  A appearing EXACTLY ONCE among LIVE outputs (unambiguous binding),
+  //   (ii) ≥ RING_SIZE-1 live outputs of amounts ≠ A (the mixin pool).
+  // All early coinbases pay the identical base reward (61 twins ⇒ (i) fails),
+  // so we bootstrap with two legitimate mechanisms:
   //
-  //  • UNDECLARED escape hatch: a tx with no inputAmountTotal skips binding/
-  //    balance checks entirely (until RingCT lands). One bootstrap self-pay
-  //    uses it — its key image still permanently marks the seed output spent.
-  //  • Fee-collecting coinbases: a block carrying a real fee-F tx pays
-  //    base+F — an amount seen nowhere else. Chaining such txs yields a
-  //    ladder of DISTINCT unique coinbase amounts U1 < U2 < ... < Uk, each
-  //    rung's own self-output paying a burn-shifted value Si ≠ anything else.
-  //    Crucially, spending Ui leaves Ui OUT of the live set, so when tx1
-  //    spends Uk (the fresh top rung) the pool of same-amount decoys for
-  //    earlier rungs stays intact while Uk itself has NO twin — exactly what
-  //    the "bind to the ONE member" rule requires… except the ring must then
-  //    contain ZERO other members of amount Uk, which holds trivially since
-  //    Uk was just minted. ✓
+  //  • Fee-collecting coinbases: a block carrying a real fee-f tx pays
+  //    base+f — an amount seen nowhere else. The bootstrap block collects a
+  //    1-pico fee, minting U1 = base+1, our first unique LIVE amount.
+  //  • DECLARED single-input/single-output self-pays: a spend of amount A is
+  //    consensus-checked only if A appears exactly once LIVE chain-wide (the
+  //    binding rule scans the whole UTXO set, not just the ring). So we never
+  //    declare any self-pay of the base reward B — B has 60 live twins for
+  //    most of this test. Instead the ladder starts from U1 = B+1 (unique by
+  //    construction): rung i declares total Ui and emits
+  //    Si = Ui - F - burn_i, another globally unique amount, while REMOVING
+  //    Ui from the live set. Each rung therefore grows the different-amount
+  //    mixin pool by one while keeping every declared value unique — until
+  //    rung 4's fresh S4 is declared-spent onto Alice.
+  //
+  // The bootstrap self-pay itself must stay UNDECLARED: its source is a
+  // base-reward coinbase (60 live twins ⇒ declaration would fail binding).
+  // A tx without inputAmountTotal skips binding/balance checks entirely
+  // (until RingCT lands) — its key image still permanently marks the seed
+  // output spent. Its mixin pool is the 60 remaining base-reward coinbases
+  // (all ≠ B); its outputs B-1 (self) and 1 (fee) stay undeclared forever,
+  // which also keeps them OUT of the ladder (B-1 regains 60 twins as blocks
+  // 62..65 pay it out via fees; declaring those would fail binding).
   //
   // Rings are assembled deterministically from amount-keyed pools:
-  //   ringFor(realKey, A) = [live outputs of amount A ≠ real]  (may be empty)
-  //                       + [live outputs of amounts ≠ A, to fill RING_SIZE-1]
-  // For declared spends of amount A the chain demands EXACTLY ONE member of
-  // amount A in the ring (the real one), so sameAmt must be EMPTY and mixins
-  // must all differ from A. For undeclared bootstrap txs any mix is legal.
+  //   ringForDeclared(A) = [live outputs of amounts ≠ A, to fill RING_SIZE-1]
+  //                        with the real key spliced in — zero same-amount
+  //                        members, exactly what the binding rule requires.
+  // For the undeclared bootstrap tx any mix is legal.
   // ─────────────────────────────────────────────────────────────────────────
   const fee = 1_000_000n; // pDNE per transfer
 
@@ -133,7 +141,7 @@ test('full transfer: miner pays alice, alice pays bob, double spend rejected', a
   // Generic single-input, single-output DECLARED spend: srcOut (from wallet w)
   // → recipient `account`, paying `outAmount`, declaring total A = srcOut.amount,
   // burning the remainder (A - outAmount - fee ≥ 0). Fully consensus-checked.
-  function mkSpend(w, account, srcOut, outAmount, randR) {
+  function mkSpend(w, account, srcOut, outAmount, randR, declaredTotal) {
     const A = srcOut.amount;
     const x = deriveOutputSecret(srcOut.txPublicKey, w.viewSecret, w.spendSecret);
     const ring = ringForDeclared(srcOut.keyHex, srcOut.key, A, 3);
@@ -145,7 +153,7 @@ test('full transfer: miner pays alice, alice pays bob, double spend rejected', a
       extra: assembleExtra(prepared),
     });
     const tx = signTx(unsigned, [{ realIndex: 3, x }]);
-    tx.inputAmountTotal = A;
+    if (declaredTotal !== undefined) tx.inputAmountTotal = declaredTotal;
     return tx;
   }
 
@@ -158,11 +166,14 @@ test('full transfer: miner pays alice, alice pays bob, double spend rejected', a
   miner.scanChain(chain);
 
   // ── Phase 2: bootstrap self-pay (undeclared input-total escape hatch) ──
-  // Spends one matured base-reward coinbase, burns 1 pico, pays base-1 back
-  // to the miner. Its BLOCK's coinbase pays base+1 (= U1, unique).
-  const mkSelfPay = (sourceOut, rScalar) => {
+  // Spends one matured base-reward coinbase B, pays B-1 back to the miner and
+  // routes 1 pico as the block's fee. Undeclared ⇒ no amount binding; its
+  // mixin pool is the other 60 base-reward coinbases. The block carrying this
+  // fee-1 tx pays base+1 as its coinbase (= U1, unique).
+  const mkSelfPay = (sourceOut, rScalar, declaredTotal) => {
     const x = deriveOutputSecret(sourceOut.txPublicKey, miner.viewSecret, miner.spendSecret);
-    // Undeclared total ⇒ binding skipped ⇒ same-amount members are legal here.
+    // Undeclared total ⇒ binding skipped ⇒ same-amount members would be legal,
+    // but we still keep the ring honest by excluding the real key only.
     const decoys = pickBy(() => true, RING_SIZE - 1, sourceOut.keyHex);
     const ring = decoys.map(hexToBytes);
     const realIdx = 2;
@@ -177,47 +188,69 @@ test('full transfer: miner pays alice, alice pays bob, double spend rejected', a
       feePico: 1n,
       extra: assembleExtra(prepared),
     });
-    return signTx(unsigned, [{ realIndex: realIdx, x }]); // deliberately no inputAmountTotal
+    const tx = signTx(unsigned, [{ realIndex: realIdx, x }]);
+    if (declaredTotal !== undefined) tx.inputAmountTotal = declaredTotal;
+    return tx;
   };
   const seedOut = miner.availableOutputs(chain.height)[0];
   assert.ok(seedOut, 'need a matured coinbase to bootstrap');
-  prev = mineNext(chain, miner, prev, 120, [mkSelfPay(seedOut, 5n)], 0n, 99n);
+  // The block must collect the tx's 1-pico fee so its coinbase pays B+1 —
+  // otherwise it would pay plain base and collide with the other 60 live
+  // base-reward coinbases, breaking rung 1's unique-amount binding.
+  prev = mineNext(chain, miner, prev, 120, [mkSelfPay(seedOut, 5n)], 1n, 99n);
   await sleep();
 
-  // ── Phase 3: unique-amount ladder via REAL declared fee-bearing self-pays ──
-  // Rung i spends Ui (declared ⇒ fully checked; valid because Ui appears
-  // exactly once live and its ring contains no other Ui-valued member),
-  // collects fee F into the next coinbase (U(i+1) = base + F·i + 1) and pays
-  // the miner Si = Ui - F - burn_i (burn_i = 1000·i keeps every Si distinct
-  // from every Uj and Sk). After 4 rungs, U5 = base + 4F + 1 is freshly
-  // minted, unique, and immediately spendable (non-coinbase unlockTime = 0).
+  // ── Phase 3: unique-amount ladder via DECLARED fee-bearing self-pays ──
+  // The declared-input pool starts EMPTY: every early output pays the base
+  // reward B (61 twins ⇒ nothing is bindable). Each rung i fixes that one
+  // step at a time:
+  //   • it mines an EMPTY block first, whose fee-collecting predecessor made
+  //     the target amount Ui = B + f_i unique live (f_i = 2^i picos, paid out
+  //     as tx fees below — no two blocks ever collect the same fee sum, so no
+  //     two Ui can collide);
+  //   • it then DECLARED-spends Ui (binding succeeds: exactly one live output
+  //     carries that amount) into Si = Ui - F - burn_i, another globally
+  //     unique amount (burn_i = 1000·i staggers the Si against each other and
+  //     against every Uj/f-value), while removing Ui from the live set.
+  // Rung sources are always the previous rung's self-output:
+  //   U1 = B+1 (from the bootstrap block's fee), U2 = S1, …, U4 = S3.
+  // After 4 rungs, S4 is fresh, unique, immediately spendable (non-coinbase
+  // unlockTime = 0) — and tx1 declared-spends it onto Alice.
   const minerAccount = keysFromAddress(miner.getAddress());
-  let curU = prev.coinbase.outputs[0].amount; // U1 = base + 1
+  let curU = prev.coinbase.outputs[0].amount; // U1 = B + 1 (bootstrap block fee)
   const seen = new Map(); // amount string -> description (distinctness audit)
   seen.set(curU.toString(), 'U1');
+  const ladderFees = [1_000_000n, 2_000_000n, 3_000_000n, 4_000_000n]; // per rung
+  const emptyFee = 16n; // tiny fee: funds rung i+1's unique coinbase B + 2^(i+1)
   for (let i = 1; i <= 4; i++) {
     miner.scanChain(chain);
     const srcOut = miner.availableOutputs(chain.height).find((o) => o.amount === curU);
     assert.ok(srcOut, `ladder rung ${i}: need live output with amount ${curU}`);
     const burn = 1000n * BigInt(i);
-    const s = curU - fee - burn;
+    const F = ladderFees[i - 1];
+    const s = curU - F - burn;
     assert.ok(!seen.has(s.toString()), `rung ${i} self-output amount collides with ${seen.get(s.toString())}`);
     seen.set(s.toString(), `S${i}`);
-    const tx = mkSpend(miner, minerAccount, srcOut, s, 100n + BigInt(i));
+    const nextCb = 1n << BigInt(i + 1); // coinbase of the upcoming empty block
+    assert.ok(!seen.has(nextCb.toString()), `rung ${i} empty-block coinbase amount collides`);
+    seen.set(nextCb.toString(), `U${i + 1}`);
+    const tx = mkSpend(miner, minerAccount, srcOut, s, 100n + BigInt(i), curU, F);
     assert.ok(verifyTxStructure(tx).ok, `ladder tx ${i} invalid: ${verifyTxStructure(tx).reason}`);
-    prev = mineNext(chain, miner, prev, 120, [tx], fee, BigInt(200 + i));
+    prev = mineNext(chain, miner, prev, 120, [tx], F, BigInt(200 + i));
     await sleep();
-    curU = prev.coinbase.outputs[0].amount; // U(i+1) = base + F·i + 1
-    assert.ok(!seen.has(curU.toString()), `rung ${i + 1} coinbase amount collides`);
-    seen.set(curU.toString(), `U${i + 1}`);
+    // Empty block collecting a fresh tiny fee mints B + 2^(i+1) — the next
+    // rung's unique, immediately-spendable (unlockTime 0) source S… rather,
+    // its own coinbase joins the pool; the DECLARED source stays s (S_i).
+    prev = mineNext(chain, miner, prev, 120, [], emptyFee, BigInt(300 + i));
+    await sleep();
+    curU = s; // chain through this rung's declared self-output
   }
-  miner.scanChain(chain);
-  const uTop = curU; // U5, unique & live (just minted by rung 4's block)
+  const uTop = curU; // S4, unique & live (minted by rung 4's self-output)
 
-  // ── tx1: spend the ladder-top unique coinbase U5 → alice ──
-  // Declared total A = U5: exactly one live output carries it (the real
-  // source), so ringForDeclared builds a ring whose ONLY U5 member is real —
-  // the chain binds unambiguously. Pays alice U5 - fee - burn1 (burn keeps
+  // ── tx1: spend the ladder-top unique output S4 → alice ──
+  // Declared total A = S4: exactly one live output carries it (the real
+  // source), so ringForDeclared builds a ring whose ONLY S4 member is real —
+  // the chain binds unambiguously. Pays alice S4 - fee - burn1 (burn keeps
   // alice's amount distinct from every ladder value → tx2 can bind later).
   const src1 = miner.availableOutputs(chain.height).find((o) => o.amount === uTop);
   assert.ok(src1, 'ladder-top coinbase must be available');
@@ -226,7 +259,7 @@ test('full transfer: miner pays alice, alice pays bob, double spend rejected', a
   const payAlice = uTop - fee - burn1;
   assert.ok(!seen.has(payAlice.toString()), 'alice payment amount must stay globally unique');
   seen.set(payAlice.toString(), 'payAlice');
-  const tx1 = mkSpend(miner, aliceAccount, src1, payAlice, 7n);
+  const tx1 = mkSpend(miner, aliceAccount, src1, payAlice, 7n, uTop);
   assert.ok(verifyTxStructure(tx1).ok, `tx1 invalid: ${verifyTxStructure(tx1).reason}`);
   assert.equal(tx1.inputs[0].ring.length, RING_SIZE);
   assert.equal(tx1.inputAmountTotal, uTop);
