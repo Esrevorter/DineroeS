@@ -1,0 +1,33 @@
+{
+  "name": "dineroes",
+  "version": "0.1.0",
+  "description": "DineroeS — a privacy-focused cryptocurrency in pure JavaScript, inspired by Monero (ring signatures, stealth addresses, key images)",
+  "type": "module",
+  "main": "src/index.js",
+  "license": "GPL-2.0-only",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "dinesd": "bin/dinesd.js",
+    "dines-wallet": "bin/dines-wallet.js",
+    "dines-miner": "bin/dines-miner.js"
+  },
+  "scripts": {
+    "test": "node --test tests/"
+  },
+  "keywords": [
+    "cryptocurrency",
+    "monero",
+    "privacy",
+    "ring-signatures",
+    "stealth-addresses",
+    "ed25519",
+    "blockchain"
+  ],
+  "dependencies": {
+    "@noble/curves": "^2.4.0",
+    "@noble/ed25519": "^3.2.0",
+    "@noble/hashes": "^2.4.0"
+  }
+}
